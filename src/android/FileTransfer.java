@@ -38,6 +38,16 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.Inflater;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 
 import org.apache.cordova.CallbackContext;
 import org.apache.cordova.CordovaPlugin;
@@ -662,6 +672,7 @@ public class FileTransfer extends CordovaPlugin {
 
         final CordovaResourceApi resourceApi = webView.getResourceApi();
 
+        final boolean trustEveryone = args.optBoolean(2);
         final String objectId = args.getString(3);
         final JSONObject headers = args.optJSONObject(4);
 
@@ -716,6 +727,8 @@ public class FileTransfer extends CordovaPlugin {
                 Uri targetUri = resourceApi.remapUri(
                         tmpTarget.getScheme() != null ? tmpTarget : Uri.fromFile(new File(target)));
                 HttpURLConnection connection = null;
+                HostnameVerifier oldHostnameVerifier = null;
+                SSLSocketFactory oldSocketFactory = null;
                 File file = null;
                 PluginResult result = null;
                 TrackingInputStream inputStream = null;
@@ -744,6 +757,16 @@ public class FileTransfer extends CordovaPlugin {
                         // Open a HTTP connection to the URL based on protocol
                         connection = resourceApi.createHttpConnection(sourceUri);
                         connection.setRequestMethod("GET");
+
+                        if (useHttps && trustEveryone) {
+                            // Setup the HTTPS connection class to trust everyone
+                            HttpsURLConnection https = (HttpsURLConnection)connection;
+                            oldSocketFactory = trustAllHosts(https);
+                            // Save the current hostnameVerifier
+                            oldHostnameVerifier = https.getHostnameVerifier();
+                            // Setup the connection not to verify hostnames
+                            https.setHostnameVerifier(DO_NOT_VERIFY);
+                        }
 
                         // TODO: Make OkHttp use this CookieManager by default.
                         String cookie = getCookies(sourceUri.toString());
@@ -867,6 +890,14 @@ public class FileTransfer extends CordovaPlugin {
                     synchronized (activeRequests) {
                         activeRequests.remove(objectId);
                     }
+                    if (connection != null) {
+                        // Revert back to the proper verifier and socket factories
+                        if (trustEveryone && useHttps) {
+                            HttpsURLConnection https = (HttpsURLConnection) connection;
+                            https.setHostnameVerifier(oldHostnameVerifier);
+                            https.setSSLSocketFactory(oldSocketFactory);
+                        }
+                    }
 
                     if (result == null) {
                         result = new PluginResult(PluginResult.Status.ERROR, createFileTransferError(CONNECTION_ERR, source, target, connection, null));
@@ -913,5 +944,50 @@ public class FileTransfer extends CordovaPlugin {
                 }
             });
         }
+    }
+    
+    // always verify the host - don't check for certificate
+    private static final HostnameVerifier DO_NOT_VERIFY = new HostnameVerifier() {
+        public boolean verify(String hostname, SSLSession session) {
+            return true;
+        }
+    };
+
+    // Create a trust manager that does not validate certificate chains
+    private static final TrustManager[] trustAllCerts = new TrustManager[] { new X509TrustManager() {
+        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+            return new java.security.cert.X509Certificate[] {};
+        }
+        
+        public void checkClientTrusted(X509Certificate[] chain,
+                String authType) throws CertificateException {
+        }
+        
+        public void checkServerTrusted(X509Certificate[] chain,
+                String authType) throws CertificateException {
+        }
+    } };
+
+    /**
+     * This function will install a trust manager that will blindly trust all SSL
+     * certificates.  The reason this code is being added is to enable developers
+     * to do development using self signed SSL certificates on their web server.
+     *
+     * The standard HttpsURLConnection class will throw an exception on self
+     * signed certificates if this code is not run.
+     */
+    private static SSLSocketFactory trustAllHosts(HttpsURLConnection connection) {
+        // Install the all-trusting trust manager
+        SSLSocketFactory oldFactory = connection.getSSLSocketFactory();
+        try {
+            // Install our all trusting manager
+            SSLContext sc = SSLContext.getInstance("TLS");
+            sc.init(null, trustAllCerts, new java.security.SecureRandom());
+            SSLSocketFactory newFactory = sc.getSocketFactory();
+            connection.setSSLSocketFactory(newFactory);
+        } catch (Exception e) {
+            LOG.e(LOG_TAG, e.getMessage(), e);
+        }
+        return oldFactory;
     }
 }
